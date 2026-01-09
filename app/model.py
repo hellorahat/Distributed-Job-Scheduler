@@ -55,6 +55,8 @@ class JobCancelResponse(BaseModel):
     # State after attempting cancellation
     state: JobState
 
+    message: Optional[str] = None
+
 
 class JobRecord(BaseModel):
     """
