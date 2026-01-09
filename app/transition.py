@@ -10,11 +10,11 @@ State transition rules:
 
 from typing import Dict, Any, TYPE_CHECKING, cast
 
-from model import JobState
-from redis_client import get_redis
+from model import JobState, JobRecord
+from utils.time import now_ms
 
 if TYPE_CHECKING:
-    from redis.client import Redis
+    from redis import Redis
 
 ALLOWED_TRANSITIONS = {
     JobState.scheduled: {JobState.queued, JobState.canceled},
@@ -26,14 +26,14 @@ ALLOWED_TRANSITIONS = {
 }
 MAX_RETRIES = 5
 BACKOFF_BASE_MS = 500
-LEASE_EXPIRE_MS = 30000
+LEASE_DURATION_MS = 30000
 
 
 def _get_job(redis: 'Redis', job_id: str) -> dict | None:
     data = redis.hgetall(f'job:{job_id}')
     if not data:
         return None
-    
+
     data = cast(dict[str, str], data)
     data['state'] = JobState(data['state'])
     return data
@@ -47,30 +47,65 @@ def _assert_transition(cur_state: JobState, new_state: JobState):
         )
 
 
-def schedule_job(job_id: str,
+def schedule_job(redis: 'Redis',
+                 job_id: str,
                  task: str,
                  payload: Dict[str, Any],
-                 run_at: str
+                 run_at_ms: int
                  ):
-    pass
+
+    now = now_ms()
+    record = JobRecord(
+        id=job_id,
+        state=JobState.scheduled,
+        task=task,
+        payload=payload,
+
+        run_at_ms=run_at_ms,
+        created_at_ms=now,
+        updated_at_ms=now,
+
+        attempts=0,
+        max_retries=MAX_RETRIES,
+        backoff_base_ms=BACKOFF_BASE_MS,
+
+        lease_owner="",
+        lease_expires_at_ms=0,
+    )
+
+    redis.hset(f'job:{job_id}', mapping=record.model_dump())
 
 
-
-def enqueue_job(job_id):
-    pass
-
-
-def lease_job(job_id):
-    pass
+def enqueue_job(redis: 'Redis', job_id: str):
+    data = _get_job(redis, job_id)
+    if not data:
+        return
+    _assert_transition(data['state'], JobState.queued)
 
 
-def complete_job(job_id):
-    pass
+def lease_job(redis: 'Redis', job_id: str):
+    data = _get_job(redis, job_id)
+    if not data:
+        return
+    _assert_transition(data['state'], JobState.running)
 
 
-def fail_job(job_id, error):
-    pass
+def complete_job(redis: 'Redis', job_id):
+    data = _get_job(redis, job_id)
+    if not data:
+        return
+    _assert_transition(data['state'], JobState.completed)
 
 
-def cancel_job(job_id):
-    pass
+def fail_job(redis: 'Redis', job_id, error):
+    data = _get_job(redis, job_id)
+    if not data:
+        return
+    _assert_transition(data['state'], JobState.failed)
+
+
+def cancel_job(redis: 'Redis', job_id):
+    data = _get_job(redis, job_id)
+    if not data:
+        return
+    _assert_transition(data['state'], JobState.canceled)
