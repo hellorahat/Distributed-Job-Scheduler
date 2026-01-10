@@ -1,4 +1,3 @@
-# app/task_registry.py
 from typing import Callable, Dict
 
 TASKS: Dict[str, Callable[[dict], None]] = {}
