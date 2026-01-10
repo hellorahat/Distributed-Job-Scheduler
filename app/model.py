@@ -69,6 +69,7 @@ class JobRecord(BaseModel):
     task: str
     payload: Dict[str, Any]
 
+    last_error: Optional[str] = None
     attempts: int
     max_retries: int
     backoff_base_ms: int
@@ -77,8 +78,8 @@ class JobRecord(BaseModel):
     created_at_ms: int
     updated_at_ms: int
 
-    lease_owner: str
-    lease_expires_at_ms: int
+    lease_owner: Optional[str] = None
+    lease_expires_at_ms: Optional[int] = None
 
     class Config:
         allow_mutation = False
