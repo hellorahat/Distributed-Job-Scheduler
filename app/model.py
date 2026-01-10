@@ -1,7 +1,8 @@
 from enum import Enum
+import json
 from typing import Dict, Optional, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, field_serializer
 
 
 class JobState(str, Enum):
@@ -63,6 +64,8 @@ class JobRecord(BaseModel):
     Immutable snapshot of job:{id} from Redis.
     """
 
+    model_config = ConfigDict(frozen=True)
+
     id: str
     state: JobState
 
@@ -81,5 +84,6 @@ class JobRecord(BaseModel):
     lease_owner: Optional[str] = None
     lease_expires_at_ms: Optional[int] = None
 
-    class Config:
-        allow_mutation = False
+    @field_serializer("payload", when_used="json")
+    def serialize_payload(self, payload: Dict[str, Any]) -> str:
+        return json.dumps(payload)
