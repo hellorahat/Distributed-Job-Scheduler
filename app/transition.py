@@ -8,17 +8,20 @@ State transition rules:
 - At-least-once execution is expected
 """
 
+from collections.abc import Callable
 from typing import Dict, Optional, Any, TYPE_CHECKING, cast
 
-from model import JobState, JobRecord
-from utils.time import now_ms
+from app.model import JobState, JobRecord
+from app.utils.time import now_ms
+from app.storage.redis_keys import RedisKeys
+
+from redis.exceptions import WatchError
 
 if TYPE_CHECKING:
     from redis import Redis
     from redis.client import Pipeline
-    from storage.redis_keys import RedisKeys
 
-ALLOWED_TRANSITIONS = {
+STATE_MACHINE = {
     JobState.scheduled: {JobState.queued, JobState.canceled},
     JobState.queued: {JobState.running, JobState.canceled},
     JobState.running: {JobState.completed, JobState.failed},
@@ -31,18 +34,8 @@ BACKOFF_BASE_MS = 500
 LEASE_DURATION_MS = 30000
 
 
-def _get_job(redis: 'Redis', job_id: str) -> dict | None:
-    data = redis.hgetall(f'job:{job_id}')
-    if not data:
-        return None
-
-    data = cast(dict[str, str], data)
-    data['state'] = JobState(data['state'])
-    return data
-
-
 def _assert_transition(cur_state: JobState, new_state: JobState):
-    allowed = ALLOWED_TRANSITIONS.get(cur_state, set())
+    allowed = STATE_MACHINE.get(cur_state, set())
     if new_state not in allowed:
         raise ValueError(
             f'Illegal transition: {cur_state} -> {new_state}'
@@ -61,6 +54,65 @@ def _clean_terminal_job(pipe: 'Pipeline', job_id: str) -> None:
     pipe.zrem(RedisKeys.JOBS_LEASE, job_id)
     pipe.srem(RedisKeys.JOBS_READY, job_id)
     pipe.zrem(RedisKeys.JOBS_SCHEDULED, job_id)
+
+
+def _atomic_transition(
+    redis: "Redis",
+    job_id: str,
+    expected: JobState,
+    new_state: JobState,
+    *,
+    extra_hset: Optional[dict[str, Any]] = None,
+    pre_index_ops: Optional[Callable[['Pipeline'], None]] = None,
+    post_index_ops: Optional[Callable[['Pipeline'], None]] = None,
+) -> None:
+    key = RedisKeys.JOB.format(id=job_id)
+    extra_hset = extra_hset or {}
+
+    while True:
+        pipe = redis.pipeline(transaction=True)
+        try:
+            pipe.watch(key)
+
+            data = pipe.hgetall(key)
+            if not data:
+                pipe.unwatch()
+                return
+
+            data = cast(dict[str, str], data)
+            cur = JobState(data["state"])
+
+            _assert_transition(cur, new_state)
+
+            if cur != expected:
+                pipe.unwatch()
+                return
+
+            now = now_ms()
+
+            pipe.multi()
+
+            if pre_index_ops:
+                pre_index_ops(pipe)
+
+            pipe.hset(key, mapping={
+                "state": new_state.value,
+                "updated_at_ms": now,
+                **{k: (v.value if isinstance(v, JobState) else v)
+                   for k, v in extra_hset.items()},
+            })
+
+            if post_index_ops:
+                post_index_ops(pipe)
+
+            pipe.execute()
+            return
+
+        except WatchError:
+            # state was modified between WATCH and EXEC, retry
+            continue
+        finally:
+            pipe.reset()
 
 
 def schedule_job(redis: 'Redis',
@@ -93,110 +145,97 @@ def schedule_job(redis: 'Redis',
     )
 
     pipe = redis.pipeline()
-    pipe.hset(RedisKeys.JOB.format(id=job_id),
-              mapping=record.model_dump(mode="json"))
-    pipe.zadd(RedisKeys.JOBS_SCHEDULED, {job_id: run_at_ms})
-    pipe.execute()
 
-
-def enqueue_job(redis: 'Redis', job_id: str) -> None:
-    data = _get_job(redis, job_id)
-    if not data:
-        return
-
-    _assert_transition(data['state'], JobState.queued)
-
-    # scheduled -> queued
-    pipe = redis.pipeline()
+    data = record.model_dump(mode="json")
+    data = {k: v for k, v in data.items() if v is not None}
     pipe.hset(
         RedisKeys.JOB.format(id=job_id),
-        mapping={
-            'state': JobState.queued,
-            'updated_at_ms': now_ms(),
-        }
+        mapping=data
     )
-    pipe.zrem(RedisKeys.JOBS_SCHEDULED, job_id)
-    pipe.sadd(RedisKeys.JOBS_READY, job_id)
+
+    pipe.zadd(RedisKeys.JOBS_SCHEDULED, {job_id: run_at_ms})
+
     pipe.execute()
 
 
-def lease_job(redis: 'Redis', job_id: str, worker_id: str) -> None:
-    data = _get_job(redis, job_id)
-    if not data:
-        return
+def enqueue_job(redis: "Redis", job_id: str) -> None:
+    def post(pipe: "Pipeline") -> None:
+        pipe.zrem(RedisKeys.JOBS_SCHEDULED, job_id)
+        pipe.sadd(RedisKeys.JOBS_READY, job_id)
 
-    _assert_transition(data['state'], JobState.running)
+    _atomic_transition(
+        redis,
+        job_id,
+        expected=JobState.scheduled,
+        new_state=JobState.queued,
+        post_index_ops=post,
+    )
+
+
+def lease_job(redis: "Redis", job_id: str, worker_id: str) -> None:
     lease_expires_at_ms = now_ms() + LEASE_DURATION_MS
 
-    # queued -> running
-    pipe = redis.pipeline()
-    pipe.hset(
-        RedisKeys.JOB.format(id=job_id),
-        mapping={
-            'state': JobState.running,
-            'updated_at_ms': now_ms(),
-            'lease_expires_at_ms': lease_expires_at_ms,
-            'lease_owner': worker_id,
-        }
+    def post(pipe: "Pipeline") -> None:
+        pipe.srem(RedisKeys.JOBS_READY, job_id)
+        pipe.zadd(RedisKeys.JOBS_LEASE, {job_id: lease_expires_at_ms})
+
+    _atomic_transition(
+        redis,
+        job_id,
+        expected=JobState.queued,
+        new_state=JobState.running,
+        extra_hset={
+            "lease_expires_at_ms": lease_expires_at_ms,
+            "lease_owner": worker_id,
+        },
+        post_index_ops=post,
     )
-    pipe.srem(RedisKeys.JOBS_READY, job_id)
-    pipe.zadd(RedisKeys.JOBS_LEASE, {job_id: lease_expires_at_ms})
-    pipe.execute()
 
 
-def complete_job(redis: 'Redis', job_id: str) -> None:
-    data = _get_job(redis, job_id)
-    if not data:
-        return
+def complete_job(redis: "Redis", job_id: str) -> None:
+    def post(pipe: "Pipeline") -> None:
+        _clean_terminal_job(pipe, job_id)
 
-    _assert_transition(data['state'], JobState.completed)
-
-    pipe = redis.pipeline()
-    pipe.hset(
-        RedisKeys.JOB.format(id=job_id),
-        mapping={
-            'state': JobState.completed,
-            'updated_at_ms': now_ms(),
-        }
+    _atomic_transition(
+        redis,
+        job_id,
+        expected=JobState.running,
+        new_state=JobState.completed,
+        post_index_ops=post,
     )
-    _clean_terminal_job(pipe, job_id)
-    pipe.execute()
 
 
-def fail_job(redis: 'Redis', job_id: str, error: str) -> None:
-    data = _get_job(redis, job_id)
-    if not data:
-        return
+def fail_job(redis: "Redis", job_id: str, error: str) -> None:
+    def post(pipe: "Pipeline") -> None:
+        _clean_terminal_job(pipe, job_id)
 
-    _assert_transition(data['state'], JobState.failed)
-
-    pipe = redis.pipeline()
-    pipe.hset(
-        RedisKeys.JOB.format(id=job_id),
-        mapping={
-            'state': JobState.failed,
-            'updated_at_ms': now_ms(),
-            'last_error': error
-        }
+    _atomic_transition(
+        redis,
+        job_id,
+        expected=JobState.running,
+        new_state=JobState.failed,
+        extra_hset={"last_error": error},
+        post_index_ops=post,
     )
-    _clean_terminal_job(pipe, job_id)
-    pipe.execute()
 
 
-def cancel_job(redis: 'Redis', job_id: str) -> None:
-    data = _get_job(redis, job_id)
-    if not data:
-        return
+def cancel_job(redis: "Redis", job_id: str) -> None:
+    def post(pipe: "Pipeline") -> None:
+        _clean_terminal_job(pipe, job_id)
 
-    _assert_transition(data['state'], JobState.canceled)
+    # try both transitions: scheduled -> canceled & queued -> canceled
+    _atomic_transition(
+        redis,
+        job_id,
+        expected=JobState.scheduled,
+        new_state=JobState.canceled,
+        post_index_ops=post,
+    )
 
-    pipe = redis.pipeline()
-
-    pipe.hset(
-        RedisKeys.JOB.format(id=job_id),
-        mapping={
-            'state': JobState.canceled,
-            'updated_at_ms': now_ms(),
-        })
-    _clean_terminal_job(pipe, job_id)
-    pipe.execute()
+    _atomic_transition(
+        redis,
+        job_id,
+        expected=JobState.queued,
+        new_state=JobState.canceled,
+        post_index_ops=post,
+    )
