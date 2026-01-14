@@ -1,11 +1,11 @@
-import redis
+from redis import Redis
 
-r = redis.Redis(
+r = Redis(
     host="localhost",
     port=6379,
     decode_responses=True
 )
 
 
-def get_redis():
+def get_redis() -> Redis:
     return r
