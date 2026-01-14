@@ -5,7 +5,6 @@ from app.storage.redis_keys import RedisKeys
 from app.transition import enqueue_job
 from app.redis_client import get_redis
 
-import time
 
 if TYPE_CHECKING:
     from redis import Redis
