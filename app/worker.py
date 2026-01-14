@@ -19,6 +19,8 @@ def worker_loop(worker_id: str, poll_interval: float = 0.2) -> None:
             time.sleep(poll_interval)
             continue
 
+        assert isinstance(job_id, str)
+
         try:
             lease_job(redis, job_id, worker_id)
         except Exception:
