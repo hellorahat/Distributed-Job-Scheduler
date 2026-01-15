@@ -4,6 +4,7 @@ All keys:
 - jobs:ready – jobs ready for execution
 - jobs:lease – jobs currently owned by a worker
 - jobs:dlq – jobs that have failed above a set threshold; manual review list
+- jobs:failed - jobs that have errored
 
 **job:{id} is the single source of truth, always verify state before carrying out state transition**
 
@@ -38,5 +39,7 @@ LIST: (jobs:ready)
 SORTED SET: (jobs:lease, {job1:expiretime, job2:expiretime})
 
 #### Dead Letter Queue
-List: (jobs:dlq)
+LIST: (jobs:dlq)
 
+#### Failed Jobs
+LIST: (jobs:failed)
