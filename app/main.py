@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 
@@ -6,6 +7,25 @@ from app.worker import worker_loop
 from app.redis_client import get_redis
 from app.transition import schedule_job
 from app.model import SchedulerConfig, SchedulerContext
+
+import structlog
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
+
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
+)
 
 ctx = SchedulerContext(
     redis=get_redis(),
