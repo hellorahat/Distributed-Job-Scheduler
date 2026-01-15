@@ -2,7 +2,7 @@ from typing import cast
 
 from app.utils.time import now_ms
 from app.storage.redis_keys import RedisKeys
-from app.transition import enqueue_job, retry_job, dlq_job
+from app.scheduler.transition import enqueue_job, retry_job, dlq_job
 from app.model import SchedulerContext
 
 

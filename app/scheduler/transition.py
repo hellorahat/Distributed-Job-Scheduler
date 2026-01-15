@@ -8,12 +8,13 @@ State transition rules:
 - At-least-once execution is expected
 """
 from collections.abc import Callable
-# import logging
 from typing import Dict, Optional, Any, TYPE_CHECKING, cast
+import uuid
 
-from app.model import JobState, JobRecord, SchedulerContext
+from app.model import JobState, JobRecord, SchedulerContext, JobCancelResponse
 from app.utils.time import now_ms
 from app.storage.redis_keys import RedisKeys
+from app.scheduler.queries import get_job
 
 from redis.exceptions import WatchError
 import structlog
@@ -72,7 +73,7 @@ def _atomic_transition(
     extra_hset: Optional[dict[str, Any]] = None,
     pre_index_ops: Optional[Callable[['Pipeline'], None]] = None,
     post_index_ops: Optional[Callable[['Pipeline'], None]] = None,
-) -> None:
+) -> bool:
 
     key = RedisKeys.JOB.format(id=job_id)
     extra_hset = extra_hset or {}
@@ -85,7 +86,7 @@ def _atomic_transition(
             data = pipe.hgetall(key)
             if not data:
                 pipe.unwatch()
-                return
+                return False  # job does not exist
 
             data = cast(dict[str, str], data)
             cur = JobState(data["state"])
@@ -94,7 +95,7 @@ def _atomic_transition(
 
             if cur != expected:
                 pipe.unwatch()
-                return
+                return False  # job not in expected state
 
             now = now_ms()
 
@@ -114,7 +115,7 @@ def _atomic_transition(
                 post_index_ops(pipe)
 
             pipe.execute()
-            return
+            return True
 
         except WatchError:
             # state was modified between WATCH and EXEC, retry
@@ -124,14 +125,14 @@ def _atomic_transition(
 
 
 def schedule_job(ctx: SchedulerContext,
-                 job_id: str,
                  task: str,
                  payload: Dict[str, Any],
                  run_at_ms: Optional[int] = None,
-                 ) -> None:
+                 ) -> tuple[str, JobState]:
     # Job creation is a special case: no prior state exists
 
     config = ctx.config
+    job_id = uuid.uuid4().hex
     now = now_ms()
     run_at_ms = run_at_ms if run_at_ms is not None else now
 
@@ -166,11 +167,13 @@ def schedule_job(ctx: SchedulerContext,
     pipe.execute()
 
     logger.info(
-        "job.scheduled",
+        "job.created",
         job_id=job_id,
         run_at_ms=run_at_ms,
         task=task,
     )
+
+    return job_id, JobState.scheduled
 
 
 def enqueue_job(ctx: SchedulerContext, job_id: str) -> None:
@@ -273,30 +276,54 @@ def fail_job(ctx: SchedulerContext, job_id: str, error: str) -> None:
     )
 
 
-def cancel_job(ctx: SchedulerContext, job_id: str) -> None:
+def cancel_job(ctx: SchedulerContext, job_id: str) -> JobCancelResponse | None:
     def post(pipe: 'Pipeline') -> None:
         _clean_terminal_job(pipe, job_id)
 
-    # try both transitions: scheduled -> canceled & queued -> canceled
-    _atomic_transition(
-        ctx.redis,
-        job_id,
-        expected=JobState.scheduled,
-        new_state=JobState.canceled,
-        post_index_ops=post,
-    )
+    try:
+        # Try scheduled -> canceled
+        if _atomic_transition(
+            ctx.redis,
+            job_id,
+            expected=JobState.scheduled,
+            new_state=JobState.canceled,
+            post_index_ops=post,
+        ):
+            logger.info("job.canceled", job_id=job_id)
+            return JobCancelResponse(
+                job_id=job_id,
+                accepted=True,
+                state=JobState.canceled,
+            )
 
-    _atomic_transition(
-        ctx.redis,
-        job_id,
-        expected=JobState.queued,
-        new_state=JobState.canceled,
-        post_index_ops=post,
-    )
+        # Try queued -> canceled
+        if _atomic_transition(
+            ctx.redis,
+            job_id,
+            expected=JobState.queued,
+            new_state=JobState.canceled,
+            post_index_ops=post,
+        ):
+            logger.info("job.canceled", job_id=job_id)
+            return JobCancelResponse(
+                job_id=job_id,
+                accepted=True,
+                state=JobState.canceled,
+            )
 
-    logger.info(
-        "job.cancelled",
+    except ValueError:
+        # Illegal transition
+        pass
+
+    record = get_job(ctx, job_id)
+    if not record:
+        return None
+
+    return JobCancelResponse(
         job_id=job_id,
+        accepted=False,
+        state=record.state,
+        message=f"Cannot cancel job in state {record.state.value}",
     )
 
 
