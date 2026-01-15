@@ -11,7 +11,7 @@ State transition rules:
 from collections.abc import Callable
 from typing import Dict, Optional, Any, TYPE_CHECKING, cast
 
-from app.model import JobState, JobRecord
+from app.model import JobState, JobRecord, SchedulerContext
 from app.utils.time import now_ms
 from app.storage.redis_keys import RedisKeys
 
@@ -25,13 +25,11 @@ STATE_MACHINE = {
     JobState.scheduled: {JobState.queued, JobState.canceled},
     JobState.queued: {JobState.running, JobState.canceled},
     JobState.running: {JobState.completed, JobState.failed},
+    JobState.failed: {JobState.scheduled, JobState.dlq},
     JobState.completed: set(),
-    JobState.failed: set(),
     JobState.canceled: set(),
+    JobState.dlq: set(),
 }
-MAX_RETRIES = 5
-BACKOFF_BASE_MS = 500
-LEASE_DURATION_MS = 30000
 
 
 def _assert_transition(cur_state: JobState, new_state: JobState):
@@ -57,7 +55,7 @@ def _clean_terminal_job(pipe: 'Pipeline', job_id: str) -> None:
 
 
 def _atomic_transition(
-    redis: "Redis",
+    redis: 'Redis',
     job_id: str,
     expected: JobState,
     new_state: JobState,
@@ -66,6 +64,7 @@ def _atomic_transition(
     pre_index_ops: Optional[Callable[['Pipeline'], None]] = None,
     post_index_ops: Optional[Callable[['Pipeline'], None]] = None,
 ) -> None:
+
     key = RedisKeys.JOB.format(id=job_id)
     extra_hset = extra_hset or {}
 
@@ -115,14 +114,15 @@ def _atomic_transition(
             pipe.reset()
 
 
-def schedule_job(redis: 'Redis',
+def schedule_job(ctx: SchedulerContext,
                  job_id: str,
                  task: str,
                  payload: Dict[str, Any],
-                 run_at_ms: Optional[int] = None
+                 run_at_ms: Optional[int] = None,
                  ) -> None:
     # Job creation is a special case: no prior state exists
 
+    config = ctx.config
     now = now_ms()
     run_at_ms = run_at_ms if run_at_ms is not None else now
 
@@ -137,14 +137,14 @@ def schedule_job(redis: 'Redis',
         updated_at_ms=now,
 
         attempts=0,
-        max_retries=MAX_RETRIES,
-        backoff_base_ms=BACKOFF_BASE_MS,
+        max_retries=config.max_retries,
+        backoff_base_ms=config.backoff_base_ms,
 
         lease_owner=None,
         lease_expires_at_ms=None,
     )
 
-    pipe = redis.pipeline()
+    pipe = ctx.redis.pipeline()
 
     data = record.model_dump(mode="json")
     data = {k: v for k, v in data.items() if v is not None}
@@ -158,84 +158,134 @@ def schedule_job(redis: 'Redis',
     pipe.execute()
 
 
-def enqueue_job(redis: "Redis", job_id: str) -> None:
+def enqueue_job(ctx: SchedulerContext, job_id: str) -> None:
+    now = now_ms()
+
     def post(pipe: "Pipeline") -> None:
         pipe.zrem(RedisKeys.JOBS_SCHEDULED, job_id)
         pipe.sadd(RedisKeys.JOBS_READY, job_id)
 
     _atomic_transition(
-        redis,
+        ctx.redis,
         job_id,
         expected=JobState.scheduled,
         new_state=JobState.queued,
+        extra_hset={
+            "updated_at_ms": now,
+        },
         post_index_ops=post,
     )
 
 
-def lease_job(redis: "Redis", job_id: str, worker_id: str) -> None:
-    lease_expires_at_ms = now_ms() + LEASE_DURATION_MS
+def lease_job(ctx: SchedulerContext, job_id: str, worker_id: str) -> None:
+    now = now_ms()
+    lease_expires_at_ms = now + ctx.config.lease_duration_ms
 
     def post(pipe: "Pipeline") -> None:
         pipe.srem(RedisKeys.JOBS_READY, job_id)
         pipe.zadd(RedisKeys.JOBS_LEASE, {job_id: lease_expires_at_ms})
 
     _atomic_transition(
-        redis,
+        ctx.redis,
         job_id,
         expected=JobState.queued,
         new_state=JobState.running,
         extra_hset={
             "lease_expires_at_ms": lease_expires_at_ms,
             "lease_owner": worker_id,
+            "updated_at_ms": now,
         },
         post_index_ops=post,
     )
 
 
-def complete_job(redis: "Redis", job_id: str) -> None:
+def complete_job(ctx: SchedulerContext, job_id: str) -> None:
+    now = now_ms()
+
     def post(pipe: "Pipeline") -> None:
         _clean_terminal_job(pipe, job_id)
 
     _atomic_transition(
-        redis,
+        ctx.redis,
         job_id,
         expected=JobState.running,
         new_state=JobState.completed,
+        extra_hset={
+            "updated_at_ms": now,
+        },
         post_index_ops=post,
     )
 
 
-def fail_job(redis: "Redis", job_id: str, error: str) -> None:
-    def post(pipe: "Pipeline") -> None:
-        _clean_terminal_job(pipe, job_id)
+def fail_job(ctx: SchedulerContext, job_id: str, error: str) -> None:
+    now = now_ms()
+    
+    def post(pipe: 'Pipeline') -> None:
+        pipe.hdel(
+            RedisKeys.JOB.format(job_id),
+            "lease_owner",
+            "lease_expires_at_ms",
+        )
+        pipe.sadd(RedisKeys.JOBS_FAILED, job_id)
 
     _atomic_transition(
-        redis,
+        ctx.redis,
         job_id,
         expected=JobState.running,
         new_state=JobState.failed,
-        extra_hset={"last_error": error},
+        extra_hset={
+            "last_error": error,
+            "updated_at_ms": now,
+        },
         post_index_ops=post,
     )
 
 
-def cancel_job(redis: "Redis", job_id: str) -> None:
+def cancel_job(ctx: SchedulerContext, job_id: str) -> None:
+    now = now_ms()
+
     def post(pipe: "Pipeline") -> None:
         _clean_terminal_job(pipe, job_id)
 
     # try both transitions: scheduled -> canceled & queued -> canceled
     _atomic_transition(
-        redis,
+        ctx.redis,
         job_id,
         expected=JobState.scheduled,
         new_state=JobState.canceled,
+        extra_hset={
+            "updated_at_ms": now,
+        },
         post_index_ops=post,
     )
 
     _atomic_transition(
-        redis,
+        ctx.redis,
         job_id,
         expected=JobState.queued,
         new_state=JobState.canceled,
+        extra_hset={
+            "updated_at_ms": now,
+        },
+        post_index_ops=post,
+    )
+
+
+def retry_job(ctx: SchedulerContext, job_id: str, run_at_ms: int) -> None:
+    now = now_ms()
+
+    def post(pipe: "Pipeline") -> None:
+        pipe.srem(RedisKeys.JOBS_FAILED, job_id)
+        pipe.zadd(RedisKeys.JOBS_SCHEDULED, {job_id: run_at_ms})
+
+    _atomic_transition(
+        ctx.redis,
+        job_id,
+        expected=JobState.failed,
+        new_state=JobState.scheduled,
+        extra_hset={
+            "run_at_ms": run_at_ms,
+            "updated_at_ms": now,
+        },
         post_index_ops=post,
     )
