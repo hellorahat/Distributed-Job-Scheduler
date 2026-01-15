@@ -1,17 +1,19 @@
 import time
 import json
-from typing import Callable, Dict
+from typing import Dict
 
-from app.redis_client import get_redis
 from app.transition import lease_job, complete_job, fail_job
 from app.storage.redis_keys import RedisKeys
 from app.task_registry import TASKS
+from app.model import SchedulerContext
 
 import app.tasks  # noqa: F401
 
 
-def worker_loop(worker_id: str, poll_interval: float = 0.2) -> None:
-    redis = get_redis()
+def worker_loop(ctx: SchedulerContext,
+                worker_id: str,
+                poll_interval: float = 0.2) -> None:
+    redis = ctx.redis
     while True:
         job_id = redis.spop(RedisKeys.JOBS_READY)
 
@@ -22,7 +24,7 @@ def worker_loop(worker_id: str, poll_interval: float = 0.2) -> None:
         assert isinstance(job_id, str)
 
         try:
-            lease_job(redis, job_id, worker_id)
+            lease_job(ctx, job_id, worker_id)
         except Exception:
             # Other worker got it first, or illegal transition
             redis.sadd(RedisKeys.JOBS_READY, job_id)
@@ -31,19 +33,20 @@ def worker_loop(worker_id: str, poll_interval: float = 0.2) -> None:
         job = redis.hgetall(RedisKeys.JOB.format(id=job_id))
         if not job:
             continue
+        assert isinstance(job, Dict)
 
         task_name = job['task']
         payload = json.loads(job['payload'])
 
         task_fn = TASKS.get(task_name)
         if task_fn is None:
-            fail_job(redis, job_id, f"Unknown task: {task_name}")
+            fail_job(ctx, job_id, f"Unknown task: {task_name}")
             continue
 
         try:
             task_fn(payload)
         except Exception as e:
-            fail_job(redis, job_id, str(e))
+            fail_job(ctx, job_id, str(e))
             continue
 
-        complete_job(redis, job_id)
+        complete_job(ctx, job_id)
