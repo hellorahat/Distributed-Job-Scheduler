@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from redis import Redis
     from redis.client import Pipeline
 
-# logger = logging.getLogger(__name__)
 logger = structlog.get_logger(__name__)
 
 STATE_MACHINE = {
