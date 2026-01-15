@@ -2,7 +2,7 @@ import time
 import json
 from typing import Dict
 
-from app.transition import lease_job, complete_job, fail_job
+from app.scheduler.transition import lease_job, complete_job, fail_job
 from app.storage.redis_keys import RedisKeys
 from app.task_registry import TASKS
 from app.model import SchedulerContext
