@@ -25,9 +25,6 @@ class JobCreateRequest(BaseModel):
 
     run_at_ms: Optional[int] = None
 
-    max_retries: int = Field(default=5, ge=0)
-    backoff_base_ms: int = Field(default=500, ge=0)
-
 
 class JobCreateResponse(BaseModel):
     job_id: str
