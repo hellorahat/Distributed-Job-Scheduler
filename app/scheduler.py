@@ -1,12 +1,9 @@
-from typing import cast, TYPE_CHECKING
+from typing import cast
 
 from app.utils.time import now_ms
 from app.storage.redis_keys import RedisKeys
-from app.transition import enqueue_job
+from app.transition import enqueue_job, retry_job, dlq_job
 from app.model import SchedulerContext
-
-if TYPE_CHECKING:
-    from redis import Redis
 
 
 def _decide_retry_or_dlq(ctx: SchedulerContext, job_id: str, now: int) -> None:
@@ -14,7 +11,7 @@ def _decide_retry_or_dlq(ctx: SchedulerContext, job_id: str, now: int) -> None:
     config = ctx.config
 
     attempts = redis.hget(
-        RedisKeys.JOB.format(job_id),
+        RedisKeys.JOB.format(id=job_id),
         'attempts'
     )
 
@@ -24,12 +21,10 @@ def _decide_retry_or_dlq(ctx: SchedulerContext, job_id: str, now: int) -> None:
     attempts = int(cast(str, attempts))
 
     if attempts < config.max_retries:
-        # retry
         delay = now + config.backoff_base_ms * 2 ** (attempts - 1)
-        # enqueue_job()
+        retry_job(ctx, job_id, delay)
     else:
-        # dlq
-        pass
+        dlq_job(ctx, job_id)
 
 
 def scheduler_tick(ctx: SchedulerContext, limit: int = 100) -> None:
