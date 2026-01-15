@@ -16,6 +16,7 @@ class JobState(str, Enum):
     completed = "completed"
     failed = "failed"
     canceled = "canceled"
+    dlq = "dlq"
 
 
 class JobCreateRequest(BaseModel):
@@ -103,5 +104,5 @@ class SchedulerConfig(BaseModel):
 
 @dataclass(frozen=True)
 class SchedulerContext():
-    redis: Redis
+    redis: 'Redis'
     config: SchedulerConfig
