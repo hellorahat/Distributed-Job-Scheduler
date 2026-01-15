@@ -1,8 +1,12 @@
+from dataclasses import dataclass
 from enum import Enum
 import json
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, TYPE_CHECKING
 
 from pydantic import BaseModel, Field, ConfigDict, field_serializer
+
+if TYPE_CHECKING:
+    from redis import Redis
 
 
 class JobState(str, Enum):
@@ -43,8 +47,8 @@ class JobStatusResponse(BaseModel):
     created_at_ms: int
     updated_at_ms: int
 
-    lease_owner: str
-    lease_expires_at_ms: int
+    lease_owner: Optional[str] = None
+    lease_expires_at_ms: Optional[int] = None
 
 
 class JobCancelResponse(BaseModel):
@@ -87,3 +91,17 @@ class JobRecord(BaseModel):
     @field_serializer("payload", when_used="json")
     def serialize_payload(self, payload: Dict[str, Any]) -> str:
         return json.dumps(payload)
+
+
+class SchedulerConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    max_retries: int = 3
+    backoff_base_ms: int = 500
+    lease_duration_ms: int = 30_000
+
+
+@dataclass(frozen=True)
+class SchedulerContext():
+    redis: Redis
+    config: SchedulerConfig
