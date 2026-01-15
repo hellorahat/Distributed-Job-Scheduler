@@ -4,3 +4,4 @@ class RedisKeys:
     JOBS_READY = 'jobs:ready'
     JOBS_LEASE = 'jobs:lease'
     JOBS_DLQ = 'jobs:dlq'
+    JOBS_FAILED = 'jobs:failed'
